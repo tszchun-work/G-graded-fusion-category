@@ -2,7 +2,7 @@
 
 This repository contains Julia code for numerical simulations of the **1D Quantum Ising Fusion Category Model** using **Exact Diagonalization (ED)**. 
 
-By exploiting both spatial translation (momentum sector $k$) and the full **Ising fusion categorical symmetry** ($\mathbf{Ising} \sim \mathbf{Fib} \times \mathbb{Z}_2$), the code performs complete block-diagonalization of the Hamiltonian. This allows high-precision extraction of low-lying energy spectra, direct identification of state quantum numbers (symmetry irreps), and observation of characteristic **Conformal Field Theory (CFT)** operator content and tower structures.
+By exploiting both spatial translation (momentum sector $k$) and the full **Ising fusion categorical symmetry**, the code performs complete block-diagonalization of the Hamiltonian. This allows high-precision extraction of low-lying energy spectra, direct identification of state quantum numbers (symmetry irreps), and observation of characteristic **Conformal Field Theory (CFT)** operator content and tower structures.
 
 ---
 

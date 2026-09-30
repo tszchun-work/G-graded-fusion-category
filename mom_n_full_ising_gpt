@@ -1,0 +1,1554 @@
+"""
+Exact diagonalization of the Ising fusion category chain, block diagonalized by
+lattice momentum AND by the full Ising-category symmetry {U(1), U(psi), U(sigma)}.
+
+Implements Eqs. (7)--(8), (12)--(15) and (18)--(24) of the supplied manuscript
+(dated September 9, 2026), with kappa=+1 and periodic boundary conditions.
+Dependencies: Python >=3.10, NumPy, SciPy; Matplotlib only for the plot.
+
+Charge sectors
+--------------
+The symmetry algebra (22) is commutative. Its three one-dimensional irreps,
+Eq. (24), label the charge sectors used everywhere below:
+
+    "1"     : (U(1), U(psi), U(sigma)) = (1,  1, +sqrt2)
+    "psi"   : (1,  1, -sqrt2)
+    "sigma" : (1, -1,  0)
+
+Every (momentum m, charge) block is built and diagonalized separately. Summed
+over m their dimensions are (D+1)/4, (D+1)/4 and (D-1)/2, with D = dim H.
+
+How the full symmetry is incorporated
+-------------------------------------
+1. U(psi) swaps I<->psi on every mu site, a permutation that commutes with T.
+   Orbit representatives of the abelian group G = <T, U(psi)> = Z_L x Z_2 give
+   the (m, U(psi)=+-1) blocks with the same machinery, and the same sparsity,
+   as momentum alone. Since U(sigma)U(psi) = U(sigma), U(sigma) vanishes on
+   U(psi) = -1, so that block IS the "sigma" block. Nothing else is needed.
+
+2. On U(psi) = +1, S = U(sigma)/sqrt2 is a Hermitian involution (Eq. 22c:
+   S^2 = (1+U(psi))/2 = 1). U(sigma) exchanges sigma and mu segments (Eq. 19),
+   so it maps the layer with n_s sigma sites onto the layer with L-n_s sigma
+   sites. Every H_flip term changes n_s by exactly +-1 and H_dw is diagonal.
+   Split the (m,+) space into
+
+       A : n_s < L/2,        B = S(A) : n_s > L/2,
+
+   and, at n_s = L/2 (even L), put one member of each pair of complementary
+   grade necklaces [g] != [gbar] in A and the other in B. The
+   self-complementary necklaces [g] = [gbar] form a small remainder E.
+   The vectors (|a> +- S|a>)/sqrt2 (a in A), together with the S eigenvectors
+   inside each E necklace (tiny dense blocks), are orthonormal bases of the
+   S = +-1 eigenspaces, and [H, S] = 0 with S^2 = 1 gives exactly
+
+       H_{+-} = H_AA +- S_AB H_BA        (plus rows and columns for E+-).
+
+   Nothing is diagonalized, projected or Gram-Schmidt orthogonalized. Because
+   H moves one layer at a time, H_BA and S_AB are nonzero only at the self-dual
+   layer n_s ~ L/2. The "1" and "psi" blocks are the half-space Hamiltonian H_AA
+   plus a boundary term at the fold, each about half of the (m,+) dimension.
+
+3. In the Z_2 labels of the domains, S_AB is a Walsh-Hadamard transform (Eq. 20):
+   a state with n sigma domains has 2**(n-1) images. As a sparse matrix it would
+   dominate the cost, and the explicit product S_AB H_BA is denser still (about
+   13x the factored cost at L=18). Large blocks are therefore applied as
+   x -> H_AA x +- S_AB (H_BA x) inside Lanczos, with S_AB done as one (n-1)-bit
+   fast Walsh-Hadamard transform per grade necklace: O(n 2**n) work instead of
+   O(4**n). The rare periodic necklaces and E use sparse transitions. Small blocks
+   are formed explicitly. SectorBlock.to_csr() always returns the explicit matrix.
+
+4. H is real, so the blocks at m and L-m are complex conjugates. By default only
+   m = 0..L//2 are diagonalized and the rest are copied (--all-momenta disables).
+
+Validation: `python ising_category_ed.py --L 8 --validate` (any L <= 10) checks every
+block against full ED built from the explicit reference operators below:
+isometry, Q^dag H Q, T = e^{-ik}, U(psi) and U(sigma) eigenvalues, the Walsh-
+Hadamard coupling against its sparse form, and the union of all block spectra.
+
+Performance (2-core, 7 GB machine, r=0, theta=pi/4): L=18 full charge-resolved
+spectrum with nev=8 in under 2 minutes. L=20 (dimension 4.5e7): ~3 s of setup,
+blocks of dimension 5.7e5 ("1", "psi") and 1.1e6 ("sigma"), 1-2 minutes per
+momentum, the full spectrum with nev=6 in 16 minutes at 3 GB peak memory.
+ARPACK makes many small BLAS calls: when running several jobs at once, set
+OPENBLAS_NUM_THREADS=1 to avoid oversubscribed BLAS threads.
+
+Conventions (unchanged from the momentum-only version)
+------------------------------------------------------
+x labels I=0, PSI=1, SIGMA=2. T is RIGHT translation, numpy.roll(state, +1).
+k = 2*pi*m/L. For a representative |a> with orbit O_a under G the symmetric ket is
+
+    |a;k,p> = |O_a|**(-1/2) sum_{b in O_a} chi(g_b)|b>,   chi(T^t U(psi)^f) = e^{ikt} p^f,
+
+where g_b maps a to b. Thus T|a;k,p> = e^{-ik}|a;k,p> and U(psi)|a;k,p> = p|a;k,p>.
+If the representative of a target state s is T^t U(psi)^f s, the reduced
+matrix element carries e^{+ikt} p^f sqrt(|O_a|/|O_b|). This is the previous
+e^{+iks} sqrt(R_a/R_b) with the psi flip included. Representatives are the orbit
+members with the smallest integer code (grade bits first, then label bits), not
+the lexicographically smallest tuple. This changes basis phases, never spectra.
+
+A state is stored as two L-bit integers: g (bit i set iff x_i = SIGMA) and
+l (bit i set iff x_i = PSI). Right translation is a left bit rotation.
+
+CFT scaling and spontaneous degeneracies refer to finite-size extrapolation,
+not to exact degeneracy of generic short rings.
+"""
+
+from __future__ import annotations
+
+import argparse
+from itertools import product
+import json
+import math
+from numbers import Integral, Real
+from pathlib import Path
+import time
+from typing import Iterator
+
+import numpy as np
+from scipy.sparse import bmat, coo_matrix, csr_matrix, eye, issparse
+from scipy.sparse.linalg import LinearOperator, eigsh
+
+I, PSI, SIGMA = 0, 1, 2
+State = tuple[int, ...]
+
+CHARGES = ("1", "psi", "sigma")
+CHARGE_LAMBDA = {  # (lambda_1, lambda_psi, lambda_sigma), Eq. (24)
+    "1": (1.0, 1.0, math.sqrt(2.0)),
+    "psi": (1.0, 1.0, -math.sqrt(2.0)),
+    "sigma": (1.0, -1.0, 0.0),
+}
+_FOLD_SIGN = {"1": 1, "psi": -1, "sigma": 0}
+_SQRT2 = math.sqrt(2.0)
+
+
+def _integer(value: int, name: str) -> int:
+    if isinstance(value, bool) or not isinstance(value, Integral):
+        raise TypeError(f"{name} must be an integer, not {value!r}")
+    return int(value)
+
+
+def _parameters(r: float, theta: float) -> tuple[float, float]:
+    for name, value in (("r", r), ("theta", theta)):
+        if not isinstance(value, Real) or not math.isfinite(value):
+            raise ValueError(f"{name} must be a finite real number")
+    return float(r), float(theta)
+
+
+def _charge(charge: str) -> str:
+    if charge not in CHARGE_LAMBDA:
+        raise ValueError(f"charge must be one of {CHARGES}, not {charge!r}")
+    return charge
+
+
+def hilbert_dimension(L: int) -> int:
+    """Exact trace(A**L), without cancellation or floating-point powers.
+
+    A=[[1,0,1],[0,1,1],[1,1,1]]. For S_L=(1+sqrt(2))**L+
+    (1-sqrt(2))**L, S_0=S_1=2 and S_L=2*S_{L-1}+S_{L-2}.
+    """
+    L = _integer(L, "L")
+    if L < 0:
+        raise ValueError("L must be nonnegative")
+    if L == 0:
+        return 3
+    previous, current = 2, 2
+    for _ in range(2, L + 1):
+        previous, current = current, 2 * current + previous
+    return 1 + current
+
+
+# =============================================================================
+# Reference implementation on explicit tuples (small L). Used for validation.
+# =============================================================================
+
+def is_valid_state(state) -> bool:
+    """Exactly the paper's periodic x-label basis, including the closing bond.
+
+    Same-grade neighbours require a_i=I and therefore equal x labels. Different
+    grades uniquely require a_i=SIGMA. SIGMA--SIGMA uses a_i=I as required by
+    Eq. (8). Hence only adjacent I--PSI and PSI--I are forbidden.
+    """
+    if len(state) == 0:
+        return False
+    if any(x not in (I, PSI, SIGMA) for x in state):
+        return False
+    return all(not ((a == I and b == PSI) or (a == PSI and b == I))
+               for a, b in zip(state, tuple(state[1:]) + (state[0],)))
+
+
+def translate(state: State, steps: int = 1) -> State:
+    """Right translation T**steps, identical to tuple(np.roll(state,steps))."""
+    steps = _integer(steps, "steps") % len(state)
+    return state[-steps:] + state[:-steps] if steps else state
+
+
+def _psi_flip(state: State) -> State:
+    return tuple(1 - x if x != SIGMA else SIGMA for x in state)
+
+
+def _local_action_valid(state: State, r: float, c: float, s: float):
+    """Apply H=-sum_i(H_dw+H_flip) to a known valid state (Eqs. 12-15).
+
+    Duplicate outputs are intentional; sparse COO assembly sums them.
+    """
+    L = len(state)
+    diagonal = 0.0
+    for j in range(L):
+        left, mid, right = state[(j - 1) % L], state[j], state[(j + 1) % L]
+        lm, mm, rm = left != SIGMA, mid != SIGMA, right != SIGMA
+        if lm != rm:                            # Eq. (14), contributes -r
+            diagonal -= r
+        transitions: tuple[tuple[int, float], ...] = ()
+        if lm and mm and rm:                    # |mu mu mu>
+            transitions = ((SIGMA, c),)
+        elif lm and mm and not rm:              # |mu mu sigma>
+            transitions = ((SIGMA, s),)
+        elif lm and not mm and rm:              # |mu sigma nu>
+            if left == right:
+                transitions = ((left, c),)
+        elif not lm and mm and rm:              # |sigma mu mu>
+            transitions = ((SIGMA, s),)
+        elif lm and not mm and not rm:          # |mu sigma sigma>
+            transitions = ((left, s),)
+        elif not lm and mm and not rm:          # |sigma mu sigma>
+            transitions = ((SIGMA, c / math.sqrt(2.0)),)
+        elif not lm and not mm and rm:          # |sigma sigma mu>
+            transitions = ((right, s),)
+        elif not lm and not mm and not rm:      # |sigma sigma sigma>
+            amplitude = c / math.sqrt(2.0)
+            transitions = ((I, amplitude), (PSI, amplitude))
+        for new_mid, amplitude in transitions:
+            if amplitude != 0.0:
+                target = state[:j] + (new_mid,) + state[j + 1:]
+                yield target, -amplitude         # Eq. (12) minus sign
+    if diagonal != 0.0:
+        yield state, diagonal
+
+
+def local_action(state, r: float, theta: float) -> Iterator[tuple[State, float]]:
+    """Yield (target_state, coefficient) for H|state>, including diagonal terms."""
+    state = tuple(state)
+    if len(state) < 3 or not is_valid_state(state):
+        raise ValueError("state must be a valid periodic fusion-label state of L>=3")
+    r, theta = _parameters(r, theta)
+    yield from _local_action_valid(state, r, math.cos(theta), math.sin(theta))
+
+
+def symmetry_action(state: State, label: str) -> Iterator[tuple[State, float]]:
+    """Full-basis action of U(psi) or U(sigma), Eqs. (18)--(21).
+
+    Eq. (20) uses I=0, PSI=1 in its exponent. Each old sigma domain becomes
+    a new uniform mu' domain. Its sign is (-1)**((mu_left+mu_right)*mu').
+    """
+    state = tuple(state)
+    if len(state) < 3 or not is_valid_state(state):
+        raise ValueError("symmetry_action requires a valid state of L>=3")
+    if label == "psi":
+        yield _psi_flip(state), 1.0
+        return
+    if label != "sigma":
+        raise ValueError("label must be 'psi' or 'sigma'")
+    L = len(state)
+    if len(set(state)) == 1:                     # Eq. (21), special n=0 case
+        if state[0] == SIGMA:
+            yield (I,) * L, 1.0
+            yield (PSI,) * L, 1.0
+        else:
+            yield (SIGMA,) * L, 1.0
+        return
+    domains = []
+    for j in range(L):
+        if state[j] == SIGMA and state[(j - 1) % L] != SIGMA:
+            sites = []
+            end = j
+            while state[end] == SIGMA:
+                sites.append(end)
+                end = (end + 1) % L
+            domains.append((sites, state[(j - 1) % L] + state[end]))
+    amplitude = 2.0 ** (-len(domains) / 2.0)
+    for values in product((I, PSI), repeat=len(domains)):
+        target = [SIGMA] * L
+        exponent = 0
+        for value, (sites, boundary_sum) in zip(values, domains):
+            exponent += boundary_sum * value
+            for site in sites:
+                target[site] = value
+        yield tuple(target), amplitude * (-1 if exponent % 2 else 1)
+
+
+class FullBasis:
+    """Every valid state as a tuple. Reference/validation only (exponential memory)."""
+
+    def __init__(self, L: int, max_states: int | None = 2_000_000):
+        self.L = _integer(L, "L")
+        if self.L < 3:
+            raise ValueError("L must be >=3 so each three-site term has distinct sites")
+        dimension = hilbert_dimension(self.L)
+        if max_states is not None and dimension > _integer(max_states, "max_states"):
+            raise MemoryError(f"L={L} has {dimension:,} states, above max_states={max_states:,}")
+        allowed = {I: (I, SIGMA), PSI: (PSI, SIGMA), SIGMA: (I, PSI, SIGMA)}
+        states: list[State] = []
+
+        def extend(prefix: list[int]) -> None:
+            if len(prefix) == self.L:
+                if prefix[0] in allowed[prefix[-1]]:  # periodic closing bond
+                    states.append(tuple(prefix))
+                return
+            for label in allowed[prefix[-1]]:
+                prefix.append(label)
+                extend(prefix)
+                prefix.pop()
+
+        for first in (I, PSI, SIGMA):
+            extend([first])
+        if len(states) != dimension:
+            raise RuntimeError("Basis enumeration failed the exact dimension identity")
+        self.states = tuple(states)
+        self.state_to_index = {state: i for i, state in enumerate(self.states)}
+
+    def __len__(self) -> int:
+        return len(self.states)
+
+
+def full_hamiltonian(basis: FullBasis, r: float, theta: float) -> csr_matrix:
+    """Unprojected real Hamiltonian on the explicit basis."""
+    r, theta = _parameters(r, theta)
+    c, s = math.cos(theta), math.sin(theta)
+    rows, columns, data = [], [], []
+    for col, state in enumerate(basis.states):
+        for target, coefficient in _local_action_valid(state, r, c, s):
+            rows.append(basis.state_to_index[target])
+            columns.append(col)
+            data.append(coefficient)
+    result = coo_matrix((data, (rows, columns)), shape=(len(basis), len(basis)),
+                        dtype=np.float64).tocsr()
+    result.eliminate_zeros()
+    return result
+
+
+def translation_operator(basis: FullBasis) -> csr_matrix:
+    rows = [basis.state_to_index[translate(state)] for state in basis.states]
+    return coo_matrix((np.ones(len(basis)), (rows, np.arange(len(basis)))),
+                      shape=(len(basis), len(basis))).tocsr()
+
+
+def symmetry_operator(basis: FullBasis, label: str, max_nnz: int = 10_000_000) -> csr_matrix:
+    """Explicit categorical symmetry (reference, small L)."""
+    rows, columns, data = [], [], []
+    for col, state in enumerate(basis.states):
+        for target, coefficient in symmetry_action(state, label):
+            if len(data) >= max_nnz:
+                raise MemoryError("Explicit symmetry matrix exceeded max_nnz guard")
+            rows.append(basis.state_to_index[target])
+            columns.append(col)
+            data.append(coefficient)
+    return coo_matrix((data, (rows, columns)), shape=(len(basis), len(basis)),
+                      dtype=np.float64).tocsr()
+
+
+# =============================================================================
+# Vectorized bit kernels
+# =============================================================================
+
+if hasattr(np, "bitwise_count"):                       # NumPy >= 2.0
+    def _popcount(x):
+        return np.bitwise_count(x).astype(np.int64)
+else:                                                  # pragma: no cover
+    _POP8 = np.array([bin(i).count("1") for i in range(256)], dtype=np.int64)
+
+    def _popcount(x):
+        x = np.asarray(x, dtype=np.int64)
+        total = np.zeros(x.shape, dtype=np.int64)
+        for shift in range(0, 64, 8):
+            total += _POP8[(x >> shift) & 0xFF]
+        return total
+
+
+def _divisors(n: int) -> list[int]:
+    return [d for d in range(1, n + 1) if n % d == 0]
+
+
+def _deposit(bits, positions, nbits: int):
+    """Scatter bit d of `bits` onto the d-th lowest set bit of `positions` (d < nbits)."""
+    out = np.zeros_like(positions)
+    remaining = positions.copy()
+    for d in range(nbits):
+        lowest = remaining & -remaining
+        out |= lowest * ((bits >> d) & 1)
+        remaining ^= lowest
+    return out
+
+
+def _extract(x, positions, nbits: int):
+    """Gather the bits of x at the nbits lowest set bits of `positions` (inverse of _deposit)."""
+    out = np.zeros_like(positions)
+    remaining = positions.copy()
+    for d in range(nbits):
+        lowest = remaining & -remaining
+        out |= ((x & lowest) != 0).astype(np.int64) << d
+        remaining ^= lowest
+    return out
+
+
+def _fwht_rows(Z) -> None:
+    """In-place unnormalized Walsh-Hadamard transform of every row of a contiguous (C, N) array."""
+    C, N = Z.shape
+    h = 1
+    while h < N:
+        view = Z.reshape(C, N // (2 * h), 2, h)
+        a, b = view[:, :, 0, :], view[:, :, 1, :]
+        difference = a - b
+        a += b
+        b[...] = difference
+        h <<= 1
+
+
+def _csr(rows, cols, data, shape, dtype) -> csr_matrix:
+    result = coo_matrix((np.asarray(data, dtype=dtype), (rows, cols)),
+                        shape=shape, dtype=dtype).tocsr()
+    result.eliminate_zeros()
+    return result
+
+
+def _local_index(mask) -> np.ndarray:
+    index = np.full(mask.size, -1, dtype=np.int64)
+    index[mask] = np.arange(int(mask.sum()))
+    return index
+
+
+# =============================================================================
+# Symmetry-adapted basis: orbits of G = <T, U(psi)> = Z_L x Z_2
+# =============================================================================
+
+class SymmetryBasis:
+    """Orbit representatives of G = <T> x <U(psi)>, stored as bit masks.
+
+    Enumeration, Hamiltonian structure and U(sigma) structure are fully
+    vectorized and independent of (r, theta, m), so they are computed once and
+    reused for every momentum, charge and parameter point. Only about D/(2L)
+    representatives and ~L Hamiltonian transitions each are stored, never all D
+    states (L=20: 1.1e6 representatives, 2.3e7 transitions, ~0.3 GB, a few
+    seconds). max_states is a guard on D, not a memory guarantee.
+    """
+
+    def __init__(self, L: int, max_states: int | None = 300_000_000):
+        self.L = L = _integer(L, "L")
+        if L < 3:
+            raise ValueError("L must be >=3 so each three-site term has distinct sites")
+        if L > 30:
+            raise ValueError("L <= 30 is required by the 2L-bit integer encoding")
+        self.dimension = hilbert_dimension(L)
+        if max_states is not None:
+            max_states = _integer(max_states, "max_states")
+            if max_states < 1:
+                raise ValueError("max_states must be positive or None")
+            if self.dimension > max_states:
+                raise MemoryError(
+                    f"L={L} has {self.dimension:,} valid states, exceeding max_states="
+                    f"{max_states:,}. Explicit ED is exponential; raise the guard only "
+                    "with sufficient memory.")
+        self.mask = (1 << L) - 1
+        self._build_grade_tables()
+        self._enumerate_representatives()
+        self._hamiltonian = None
+        self._fold = None
+        self._fold_fast = None
+        self._partition = None
+
+    def __len__(self) -> int:
+        return self.dimension
+
+    # ---- bit helpers --------------------------------------------------------
+    def _rotl(self, x, t: int):
+        """Right translation T**t of a bit mask (bit i -> bit i+t)."""
+        t %= self.L
+        if t == 0:
+            return x
+        return ((x << t) | (x >> (self.L - t))) & self.mask
+
+    def _rotl_var(self, x, t):
+        """Elementwise T**t for an array of shifts 0 <= t < L."""
+        return ((x << t) | (x >> (self.L - t))) & self.mask
+
+    def _fill(self, x, conn):
+        """Copy set bits of x from site i-1 to site i wherever conn bit i is set."""
+        step = 1
+        while step < self.L:
+            x = x | (self._rotl(x, step) & conn)
+            conn = conn & self._rotl(conn, step)
+            step <<= 1
+        return x
+
+    def momentum(self, m: int) -> int:
+        return _integer(m, "m") % self.L
+
+    def encode(self, state) -> tuple[int, int]:
+        """(g, l) bit masks of an x-label tuple."""
+        g = sum(1 << i for i, x in enumerate(state) if x == SIGMA)
+        l = sum(1 << i for i, x in enumerate(state) if x == PSI)
+        return g, l
+
+    def rep_state(self, index: int) -> State:
+        """x-label tuple of representative `index`."""
+        g, l = int(self.rep_g[index]), int(self.rep_l[index])
+        return tuple(SIGMA if (g >> i) & 1 else (l >> i) & 1 for i in range(self.L))
+
+    # ---- enumeration --------------------------------------------------------
+    def _build_grade_tables(self) -> None:
+        """Canonical rotation, rotation to it, and period of every grade mask."""
+        L = self.L
+        g = np.arange(1 << L, dtype=np.int64)
+        canon = g.copy()
+        to_canon = np.zeros(1 << L, dtype=np.int8)
+        current = g
+        for t in range(1, L):
+            current = self._rotl(current, 1)
+            better = current < canon
+            canon[better] = current[better]
+            to_canon[better] = t
+        period = np.full(1 << L, L, dtype=np.int8)
+        for d in _divisors(L)[:-1]:
+            hit = (period == L) & (self._rotl(g, d) == g)
+            period[hit] = d
+        self._canon, self._to_canon, self._gperiod = canon, to_canon, period
+
+    def _enumerate_representatives(self) -> None:
+        L, mask = self.L, self.mask
+        grades = np.arange(1 << L, dtype=np.int64)
+        necklaces = grades[self._canon == grades]
+        mu = ~necklaces & mask
+        starts = mu & self._rotl(necklaces, 1)      # mu sites whose left neighbour is sigma
+        ndomains = _popcount(starts)
+        # uniform states: all-I, all-psi, all-sigma
+        gs = [np.array([0, 0, mask], dtype=np.int64)]
+        ls = [np.array([0, mask, 0], dtype=np.int64)]
+        for n in range(1, L // 2 + 1):             # one free Z_2 label per mu domain
+            select = ndomains == n
+            if not np.any(select):
+                continue
+            count = 1 << n
+            g = np.repeat(necklaces[select], count)
+            mu_g = ~g & mask
+            labels = _deposit(np.tile(np.arange(count, dtype=np.int64), int(select.sum())),
+                              np.repeat(starts[select], count), n)
+            ls.append(self._fill(labels, mu_g & self._rotl(mu_g, 1)))
+            gs.append(g)
+        g, l = np.concatenate(gs), np.concatenate(ls)
+        # keep the smallest label mask over the stabilizer {T^{jP}} x {1, U(psi)}
+        mu = ~g & mask
+        lmin = np.minimum(l, l ^ mu)
+        P = self._gperiod[g].astype(np.int64)
+        periodic = np.flatnonzero(P < L)
+        if periodic.size:
+            lp, mp, Pp, best = l[periodic], mu[periodic], P[periodic], lmin[periodic]
+            for t in range(1, L):
+                a = np.flatnonzero(t % Pp == 0)
+                if a.size:
+                    candidate = np.minimum(self._rotl(lp[a], t), self._rotl(lp[a] ^ mp[a], t))
+                    best[a] = np.minimum(best[a], candidate)
+            lmin[periodic] = best
+        keep = l == lmin
+        g, l = g[keep], l[keep]
+        code = (g << L) | l
+        order = np.argsort(code)
+        self.rep_g, self.rep_l, self.rep_code = g[order], l[order], code[order]
+        n_reps = self.rep_g.size
+        # translation period R and psi twist t_psi: T^{t_psi} U(psi) |a> = |a>
+        R = np.full(n_reps, L, dtype=np.int64)
+        for d in _divisors(L)[:-1]:
+            hit = ((R == L) & (self._rotl(self.rep_g, d) == self.rep_g)
+                   & (self._rotl(self.rep_l, d) == self.rep_l))
+            R[hit] = d
+        tpsi = np.full(n_reps, -1, dtype=np.int64)
+        flipped = self.rep_l ^ (~self.rep_g & mask)
+        for t in range(L):
+            hit = ((tpsi < 0) & (t < R) & (self._rotl(self.rep_g, t) == self.rep_g)
+                   & (self._rotl(flipped, t) == self.rep_l))
+            tpsi[hit] = t
+        self.n_reps = n_reps
+        self.rep_period = R
+        self.rep_tpsi = tpsi
+        self.rep_orbit = np.where(tpsi < 0, 2 * R, R)          # |O_a|
+        self.rep_nsigma = _popcount(self.rep_g)
+        self.rep_cclass = self._canon[~self.rep_g & mask]      # necklace of U(sigma) image
+        self.rep_dw = _popcount(self._rotl(self.rep_g, 1) ^ self._rotl(self.rep_g, L - 1))
+        if int(self.rep_orbit.sum()) != self.dimension:
+            raise RuntimeError("Orbit enumeration failed the exact dimension identity")
+
+    # ---- targets -> representatives ----------------------------------------
+    def locate(self, g, l):
+        """Return (rep index, t, f) with T**t U(psi)**f (g, l) = representative."""
+        L, mask = self.L, self.mask
+        g = np.asarray(g, dtype=np.int64)
+        l = np.asarray(l, dtype=np.int64)
+        gc = self._canon[g]
+        t = self._to_canon[g].astype(np.int64)
+        l0 = self._rotl_var(l, t)
+        l1 = l0 ^ (~gc & mask)
+        f = (l1 < l0).astype(np.int8)
+        best = np.minimum(l0, l1)
+        periodic = np.flatnonzero(self._gperiod[gc] < L)
+        if periodic.size:                        # rare: grade pattern with period < L
+            P = self._gperiod[gc[periodic]].astype(np.int64)
+            sources = (l0[periodic], l1[periodic])
+            bb, tb, fb = best[periodic], t[periodic], f[periodic]
+            base = tb.copy()
+            for s in range(1, L):
+                a = np.flatnonzero(s % P == 0)
+                if a.size == 0:
+                    continue
+                for flip, source in enumerate(sources):
+                    candidate = self._rotl(source[a], s)
+                    better = candidate < bb[a]
+                    idx = a[better]
+                    bb[idx] = candidate[better]
+                    tb[idx] = base[idx] + s
+                    fb[idx] = flip
+            best[periodic], t[periodic], f[periodic] = bb, tb, fb
+        code = (gc << L) | best
+        rows = np.minimum(np.searchsorted(self.rep_code, code), self.n_reps - 1)
+        if np.any(self.rep_code[rows] != code):
+            raise RuntimeError("A target state has no representative (invalid state?)")
+        return rows, t % L, f
+
+    # ---- operator structure (independent of r, theta, m) -------------------
+    def hamiltonian_transitions(self):
+        """Off-diagonal structure of H on representatives, Eqs. (12)-(15).
+
+        Returns (col, row, t, f, kind): H|rep[col]> contains COEF[kind]*|s>
+        with T**t U(psi)**f s = rep[row], and COEF = (-cos theta, -sin theta,
+        -cos(theta)/sqrt2) for kind = 0, 1, 2. Diagonal: -r * rep_dw.
+        """
+        if self._hamiltonian is not None:
+            return self._hamiltonian
+        L = self.L
+        g, l = self.rep_g, self.rep_l
+        index_dtype = np.int32 if self.n_reps < 2**31 else np.int64
+        pieces: list[tuple] = []
+        for j in range(L):
+            jm, jp = (j - 1) % L, (j + 1) % L
+            bit = np.int64(1 << j)
+            gL, gM, gR = (g >> jm) & 1, (g >> j) & 1, (g >> jp) & 1
+            lL, lR = (l >> jm) & 1, (l >> jp) & 1
+            parts = []
+            # mid mu -> sigma: |mu mu mu> (c), |mu mu s>,|s mu mu> (s), |s mu s> (c/sqrt2)
+            sel = np.flatnonzero(gM == 0)
+            neighbours = gL[sel] + gR[sel]
+            parts.append((sel, g[sel] | bit, l[sel] & ~bit, neighbours.astype(np.int8)))
+            is_sigma = gM == 1
+            # |mu s nu> -> delta_{mu nu} |mu mu mu> (c)
+            sel = np.flatnonzero(is_sigma & (gL == 0) & (gR == 0) & (lL == lR))
+            parts.append((sel, g[sel] & ~bit, l[sel] | (lL[sel] << j), np.zeros(sel.size, np.int8)))
+            # |mu s s> -> |mu mu s> (s)
+            sel = np.flatnonzero(is_sigma & (gL == 0) & (gR == 1))
+            parts.append((sel, g[sel] & ~bit, l[sel] | (lL[sel] << j), np.ones(sel.size, np.int8)))
+            # |s s mu> -> |s mu mu> (s)
+            sel = np.flatnonzero(is_sigma & (gL == 1) & (gR == 0))
+            parts.append((sel, g[sel] & ~bit, l[sel] | (lR[sel] << j), np.ones(sel.size, np.int8)))
+            # |s s s> -> (|s I s> + |s psi s>) (c/sqrt2)
+            sel = np.flatnonzero(is_sigma & (gL == 1) & (gR == 1))
+            parts.append((sel, g[sel] & ~bit, l[sel], np.full(sel.size, 2, np.int8)))
+            parts.append((sel, g[sel] & ~bit, l[sel] | bit, np.full(sel.size, 2, np.int8)))
+            col = np.concatenate([p[0] for p in parts])
+            row, t, f = self.locate(np.concatenate([p[1] for p in parts]),
+                                    np.concatenate([p[2] for p in parts]))
+            pieces.append((col.astype(index_dtype), row.astype(index_dtype),
+                           t.astype(np.int16), f, np.concatenate([p[3] for p in parts])))
+        self._hamiltonian = tuple(np.concatenate(x) for x in zip(*pieces))
+        return self._hamiltonian
+
+    def sigma_transitions(self, reps):
+        """S = U(sigma)/sqrt2 restricted to U(psi)=+1, acting on the given reps.
+
+        Eq. (20): the n sigma domains become mu' domains with amplitude 2**(-n/2)
+        and sign (-1)**((mu_left+mu_right) mu'). Images related by U(psi) have equal
+        signs and the same representative on U(psi)=+1, so only 2**(n-1) images are
+        generated and doubled: S|a> has 2**(n-1) terms of amplitude 2**((1-n)/2).
+        Returns (col, row, t, amp) with T**t U(psi)**f image = rep[row].
+        """
+        L, mask = self.L, self.mask
+        reps = np.asarray(reps, dtype=np.int64)
+        g, l = self.rep_g[reps], self.rep_l[reps]
+        cols, tg, tl, amps = [], [], [], []
+        uniform_sigma = np.flatnonzero(g == mask)       # |s..s> -> |I..I> + |psi..psi>
+        if uniform_sigma.size:
+            cols.append(reps[uniform_sigma])
+            tg.append(np.zeros(uniform_sigma.size, np.int64))
+            tl.append(np.zeros(uniform_sigma.size, np.int64))
+            amps.append(np.full(uniform_sigma.size, _SQRT2))
+        uniform_mu = np.flatnonzero(g == 0)             # |I..I>, |psi..psi> -> |s..s>
+        if uniform_mu.size:
+            cols.append(reps[uniform_mu])
+            tg.append(np.full(uniform_mu.size, mask, np.int64))
+            tl.append(np.zeros(uniform_mu.size, np.int64))
+            amps.append(np.full(uniform_mu.size, 1.0 / _SQRT2))
+        generic = np.flatnonzero((g != 0) & (g != mask))
+        if generic.size:
+            gg, ll, rr = g[generic], l[generic], reps[generic]
+            sstart = gg & ~self._rotl(gg, 1) & mask      # first site of each sigma domain
+            send = gg & ~self._rotl(gg, L - 1) & mask    # last site of each sigma domain
+            wl = sstart & self._rotl(ll, 1)              # left neighbour is psi
+            wr = send & self._rotl(ll, L - 1)            # right neighbour is psi
+            conn = gg & self._rotl(gg, 1)
+            ndom = _popcount(sstart)
+            for n in np.unique(ndom):
+                n = int(n)
+                sub = np.flatnonzero(ndom == n)
+                count = 1 << (n - 1)                     # highest domain keeps label I
+
+                def rep(a, sub=sub, count=count):
+                    return np.repeat(a[sub], count)
+
+                labels = _deposit(np.tile(np.arange(count, dtype=np.int64), sub.size),
+                                  rep(sstart), n - 1)
+                labels = self._fill(labels, rep(conn))
+                exponent = _popcount(labels & rep(wl)) + _popcount(labels & rep(wr))
+                cols.append(rep(rr))
+                tg.append(~rep(gg) & mask)
+                tl.append(labels)
+                amps.append(2.0 ** ((1 - n) / 2.0) * (1 - 2 * (exponent & 1)))
+        if not cols:
+            empty = np.empty(0, np.int64)
+            return empty, empty, empty, np.empty(0)
+        row, t, _ = self.locate(np.concatenate(tg), np.concatenate(tl))
+        return np.concatenate(cols), row, t, np.concatenate(amps).astype(np.float64)
+
+    def fold_partition(self):
+        """Boolean masks (A, B, E) over representatives for the U(psi)=+1 fold."""
+        if self._partition is None:
+            L = self.L
+            n2 = 2 * self.rep_nsigma
+            middle = n2 == L
+            cls, ccls = self.rep_g, self.rep_cclass
+            self._partition = ((n2 < L) | (middle & (cls < ccls)),
+                               (n2 > L) | (middle & (cls > ccls)),
+                               middle & (cls == ccls))
+        return self._partition
+
+    def _fold_interface(self):
+        """B representatives at the fold and the self-complementary set E.
+
+        Only these enter the charge-1/psi blocks: for odd L the layer
+        n_s=(L+1)/2; for even L the layers n_s=L/2 (B and E) and n_s=L/2+1.
+        """
+        L = self.L
+        n2 = 2 * self.rep_nsigma
+        _, in_b, in_e = self.fold_partition()
+        return ((n2 == L + 1) | (n2 == L + 2) | (n2 == L)) & in_b, in_e
+
+    def fold_transitions(self):
+        """Sparse S transitions (col, row, t, amp) from all interface B reps and E (cached).
+
+        Only needed for explicit matrices; Lanczos uses fold_structure() instead.
+        """
+        if self._fold is None:
+            interface, in_e = self._fold_interface()
+            self._fold = self.sigma_transitions(np.flatnonzero(interface | in_e))
+        return self._fold
+
+    def fold_structure(self):
+        """Fast Walsh-Hadamard form of S on the fold (cached, independent of m).
+
+        For an interface B necklace g with period L and n sigma domains, the
+        2**(n-1) representatives of the class and the 2**(n-1) images in the
+        necklace of gbar are related by (Eq. 20)
+
+            S[nu, b] = 2**((1-n)/2) e^{ik t0} (-1)**(nu . w(b)),
+
+        where w_e = mu_left(e) XOR mu_right(e) for sigma domain e, nu is the new
+        label vector with the top domain fixed to I, and t0 the rotation taking
+        gbar to its canonical form. Because w has even parity, nu.w only involves
+        the lower n-1 bits: S is a single (n-1)-bit Walsh-Hadamard transform per
+        necklace, O(n 2**n) work instead of O(4**n). Periodic interface necklaces
+        and E (rare, tiny) keep sparse transitions.
+
+        Returns (groups, small): one dict per n with keys n, half, count, b_reps,
+        scatter, out_reps, out_t; and sparse (col, row, t, amp) for the rest.
+        """
+        if self._fold_fast is None:
+            L, mask = self.L, self.mask
+            interface, in_e = self._fold_interface()
+            aperiodic = self._gperiod[self.rep_g] == L
+            fast = np.flatnonzero(interface & aperiodic)
+            small = self.sigma_transitions(np.flatnonzero((interface & ~aperiodic) | in_e))
+            g, l = self.rep_g[fast], self.rep_l[fast]
+            sstart = g & ~self._rotl(g, 1) & mask
+            send = g & ~self._rotl(g, L - 1) & mask
+            ndom = _popcount(sstart)
+            nmax = int(ndom.max()) if ndom.size else 0
+            # Canonical grades have a mu site at L-1, so no sigma domain wraps around
+            # and the j-th start and j-th end belong to the same domain.
+            w = (_extract(sstart & self._rotl(l, 1), sstart, nmax)
+                 ^ _extract(send & self._rotl(l, L - 1), send, nmax))
+            groups = []
+            for n in np.unique(ndom):
+                n = int(n)
+                half = 1 << (n - 1)
+                select = np.flatnonzero(ndom == n)
+                classes, position = np.unique(g[select], return_inverse=True)
+                scatter = position * half + (w[select] & (half - 1))
+                if (select.size != classes.size * half
+                        or np.any(np.bincount(scatter, minlength=select.size) != 1)):
+                    raise RuntimeError("Walsh-Hadamard fold structure is inconsistent")
+                starts_c = classes & ~self._rotl(classes, 1) & mask
+                conn_c = classes & self._rotl(classes, 1)
+                nu = np.tile(np.arange(half, dtype=np.int64), classes.size)
+                labels = self._fill(_deposit(nu, np.repeat(starts_c, half), n - 1),
+                                    np.repeat(conn_c, half))
+                out_reps, out_t, _ = self.locate(np.repeat(~classes & mask, half), labels)
+                groups.append({"n": n, "half": half, "count": classes.size,
+                               "b_reps": fast[select], "scatter": scatter,
+                               "out_reps": out_reps, "out_t": out_t})
+            outputs = np.concatenate([grp["out_reps"] for grp in groups]) if groups else []
+            if len(np.unique(outputs)) != len(outputs):
+                raise RuntimeError("Walsh-Hadamard fold outputs are not distinct")
+            self._fold_fast = (groups, small)
+        return self._fold_fast
+
+    # ---- sectors -------------------------------------------------------------
+    def compatible(self, m: int, parity: int) -> np.ndarray:
+        """Representatives whose symmetric ket survives in sector (k=2 pi m/L, U(psi)=parity).
+
+        Requires chi = 1 on the stabilizer: e^{ikR} = 1 and, if T^{t_psi} U(psi)
+        fixes the state, e^{ik t_psi} * parity = 1. Pure integer arithmetic.
+        """
+        L = self.L
+        m = self.momentum(m)
+        if parity not in (1, -1):
+            raise ValueError("parity must be +1 or -1")
+        ok = (m * self.rep_period) % L == 0
+        twisted = self.rep_tpsi >= 0
+        if parity == 1:
+            ok &= ~twisted | ((m * self.rep_tpsi) % L == 0)
+        elif L % 2:
+            ok &= ~twisted
+        else:
+            ok &= ~twisted | ((m * self.rep_tpsi) % L == L // 2)
+        return ok
+
+    def phase_table(self, m: int):
+        """(e^{2 pi i j/L} for j < L, is_real). Index it with (m*t) % L."""
+        m = self.momentum(m)
+        table = np.exp(2j * np.pi * np.arange(self.L) / self.L)
+        if m == 0 or 2 * m == self.L:
+            return table.real.copy(), True        # only j=0 or j=L/2 occur: exactly +-1
+        return table, False
+
+
+# =============================================================================
+# (momentum, charge) blocks
+# =============================================================================
+
+class FoldCoupling:
+    """S_AB = (U(sigma)/sqrt2) from B to A at one momentum (the fold of the 1/psi blocks).
+
+    apply() uses the Walsh-Hadamard structure of SymmetryBasis.fold_structure();
+    matrix() builds the explicit sparse matrix from the independent transition
+    list sigma_transitions() (lazily: explicit blocks, dense solves, validation).
+    """
+
+    def __init__(self, basis: SymmetryBasis, m: int, comp, in_a, in_b, loc_a, loc_b,
+                 table, dtype):
+        L = basis.L
+        self.shape = (int(in_a.sum()), int(in_b.sum()))
+        self.dtype = dtype
+        self._basis, self._m, self._table = basis, m, table
+        self._masks = (comp, in_a, in_b, loc_a, loc_b)
+        self._matrix = None
+        groups, small = basis.fold_structure()
+        self.groups = []
+        column_counts = np.zeros(self.shape[1], dtype=np.int64)
+        work = 0
+        for grp in groups:
+            src, rows = loc_b[grp["b_reps"]], loc_a[grp["out_reps"]]
+            if np.any(src < 0) or np.any(rows < 0):
+                raise RuntimeError("U(sigma) does not map the fold's B necklaces into A")
+            factor = 2.0 ** ((1 - grp["n"]) / 2.0) * table[(m * grp["out_t"]) % L]
+            self.groups.append((grp["count"], grp["half"], src, grp["scatter"], rows,
+                                factor.astype(dtype)))
+            column_counts[src] += grp["half"]
+            work += grp["count"] * grp["half"] * max(grp["n"] + 1, 2)
+        self.sparse = self._sparse_part(small, dtype)
+        column_counts += np.bincount(self.sparse.indices, minlength=self.shape[1])
+        self.column_counts = column_counts            # nonzeros per column of S_AB
+        self.cost = work + self.sparse.nnz            # rough flop count of apply()
+
+    def _sparse_part(self, transitions, dtype) -> csr_matrix:
+        comp, in_a, in_b, loc_a, loc_b = self._masks
+        L, m, basis = self._basis.L, self._m, self._basis
+        scol, srow, st, samp = transitions
+        select = in_b[scol] & comp[srow]
+        scol, srow = scol[select], srow[select]
+        if np.any(~in_a[srow]):
+            raise RuntimeError("U(sigma) maps B outside A: fold partition is inconsistent")
+        orbit = basis.rep_orbit.astype(np.float64)
+        data = samp[select] * self._table[(m * st[select]) % L] * np.sqrt(orbit[scol] / orbit[srow])
+        return _csr(loc_a[srow], loc_b[scol], data, self.shape, dtype)
+
+    def matrix(self) -> csr_matrix:
+        """Explicit sparse S_AB (built once, from sigma_transitions)."""
+        if self._matrix is None:
+            self._matrix = self._sparse_part(self._basis.fold_transitions(), self.dtype)
+        return self._matrix
+
+    def apply(self, xB):
+        """S_AB @ xB by one (n-1)-bit Walsh-Hadamard transform per necklace."""
+        xB = np.asarray(xB)
+        out_dtype = np.result_type(self.dtype, xB.dtype)
+        if xB.ndim == 2:
+            out = np.empty((self.shape[0], xB.shape[1]), dtype=out_dtype)
+            for j in range(xB.shape[1]):
+                out[:, j] = self.apply(xB[:, j])
+            return out
+        y = np.array(self.sparse @ xB, dtype=out_dtype)
+        for count, half, src, scatter, rows, factor in self.groups:
+            Z = np.empty(count * half, dtype=out_dtype)
+            Z[scatter] = xB[src]
+            _fwht_rows(Z.reshape(count, half))
+            y[rows] += Z * factor
+        return y
+
+
+class SectorBlock:
+    """Hamiltonian block for one momentum m and one Ising-category charge.
+
+    Basis vectors (columns), in this order:
+      "sigma": |a;k,-> for a in reps.
+      "1"/"psi" (sign s=+1/-1): (|a;k,+> + s S|a;k,+>)/sqrt2 for a in reps (the set
+          A), followed by sum_e U_E[e,j]|e;k,+> over e in e_reps (self-complementary
+          necklaces, only for even L).
+    For the folded charges the matrix is [[H_AA + s S_AB H_BA, W^H], [W, D]] with
+    W = sqrt2 U_E^H H_EA and D = U_E^H H_EE U_E. H_AA, H_BA and S (a FoldCoupling
+    representing S_AB) are shared by the "1" and "psi" blocks of the same momentum.
+    """
+
+    def __init__(self, L, m, charge, H, reps, *, sign=0, H_BA=None, S=None,
+                 e_reps=None, U_E=None, W=None, D=None):
+        self.L, self.m, self.charge = L, m, charge
+        self.H = H
+        self.reps = reps
+        self.sign = sign
+        self.H_BA, self.S = H_BA, S
+        self.e_reps = np.empty(0, np.int64) if e_reps is None else e_reps
+        self.U_E, self.W, self.D = U_E, W, D
+        self._WH = None if W is None else W.getH().tocsr()
+        n = H.shape[0] + (0 if W is None else W.shape[0])
+        self.shape = (n, n)
+        self.dtype = H.dtype
+
+    @property
+    def k(self) -> float:
+        return 2.0 * math.pi * self.m / self.L
+
+    @property
+    def charge_eigenvalues(self) -> tuple[float, float, float]:
+        return CHARGE_LAMBDA[self.charge]
+
+    @property
+    def folded(self) -> bool:
+        return self.sign != 0
+
+    @property
+    def S_AB(self) -> csr_matrix:
+        """Explicit sparse S_AB (built on first use)."""
+        return self.S.matrix()
+
+    def coupling_nnz_estimate(self) -> int:
+        """Upper bound on nnz(S_AB @ H_BA) without forming it."""
+        if not self.folded or self.H_BA.nnz == 0:
+            return 0
+        return int(np.dot(self.S.column_counts, np.diff(self.H_BA.indptr)))
+
+    def coupling(self, x):
+        """C x = S_AB (H_BA x) with the fast Walsh-Hadamard application of S_AB."""
+        return self.S.apply(self.H_BA @ x)
+
+    def to_csr(self) -> csr_matrix:
+        """Explicit sparse matrix of the block."""
+        if not self.folded:
+            return self.H
+        top = (self.H + self.sign * (self.S_AB @ self.H_BA)).tocsr()
+        if self.W is None or self.W.shape[0] == 0:
+            return top
+        return bmat([[top, self._WH], [self.W, self.D]], format="csr")
+
+    def to_dense(self) -> np.ndarray:
+        return self.to_csr().toarray()
+
+    def matvec(self, x):
+        """Apply the block (factored form for the folded charges); x may be 2-D."""
+        if not self.folded:
+            return self.H @ x
+        nA = self.H.shape[0]
+        xa = x[:nA]
+        y = self.H @ xa
+        if self.H_BA.nnz:
+            y = y + self.sign * self.coupling(xa)
+        if self.W is None or self.W.shape[0] == 0:
+            return y
+        xe = x[nA:]
+        return np.concatenate([y + self._WH @ xe, self.W @ xa + self.D @ xe])
+
+    def operator(self, block_format: str = "auto"):
+        """CSR matrix or LinearOperator for iterative eigensolvers.
+
+        "auto" forms the explicit matrix only while S_AB H_BA is cheaper than its
+        factored application (small L); larger blocks use H_AA x +- S_AB(H_BA x)
+        with the Walsh-Hadamard form of S_AB.
+        """
+        if block_format not in ("auto", "explicit", "factored"):
+            raise ValueError("block_format must be 'auto', 'explicit' or 'factored'")
+        if not self.folded or block_format == "explicit":
+            return self.to_csr()
+        if block_format == "auto" and (self.coupling_nnz_estimate()
+                                       <= self.S.cost + self.H_BA.nnz + 200_000):
+            return self.to_csr()
+        return LinearOperator(self.shape, matvec=self.matvec, rmatvec=self.matvec,
+                              matmat=self.matvec, dtype=self.dtype)
+
+    def __repr__(self) -> str:
+        return (f"SectorBlock(L={self.L}, m={self.m}, charge={self.charge!r}, "
+                f"dim={self.shape[0]}, dtype={np.dtype(self.dtype).name})")
+
+
+def _self_dual_eigenvectors(S_EE: csr_matrix, classes: np.ndarray, dtype):
+    """Eigenvectors of S inside each self-complementary necklace (tiny dense blocks)."""
+    nE = S_EE.shape[0]
+    bounds = np.flatnonzero(np.diff(classes)) + 1
+    starts, ends = np.r_[0, bounds], np.r_[bounds, nE]
+    entries = {1: ([], [], []), -1: ([], [], [])}
+    counts = {1: 0, -1: 0}
+    for a0, a1 in zip(starts, ends):
+        block = S_EE[a0:a1, a0:a1].toarray()
+        w, V = np.linalg.eigh(block)
+        if (np.max(np.abs(block - block.conj().T)) > 1e-10
+                or np.max(np.abs(np.abs(w) - 1.0)) > 1e-9):
+            raise RuntimeError("S restricted to a self-complementary necklace is not "
+                               "a Hermitian involution")
+        for sign in (1, -1):
+            vectors = V[:, w * sign > 0]
+            rr, cc = np.nonzero(np.ones(vectors.shape, dtype=bool))
+            rows, cols, vals = entries[sign]
+            rows.append(a0 + rr)
+            cols.append(counts[sign] + cc)
+            vals.append(vectors[rr, cc])
+            counts[sign] += vectors.shape[1]
+    result = {}
+    for sign in (1, -1):
+        rows, cols, vals = entries[sign]
+        result[sign] = _csr(np.concatenate(rows), np.concatenate(cols), np.concatenate(vals),
+                            (nE, counts[sign]), dtype)
+    return result
+
+
+def build_symmetry_blocks(basis: SymmetryBasis, m: int, r: float, theta: float,
+                          charges=CHARGES) -> dict[str, SectorBlock]:
+    """All requested charge blocks {charge: SectorBlock} of momentum m.
+
+    Columns are input kets, rows output kets. The "sigma" block is the
+    U(psi)=-1 orbit block; "1" and "psi" share H_AA, H_BA and the fold coupling
+    S and differ only in the sign of S_AB H_BA and in their E rows/columns.
+    """
+    m = basis.momentum(m)
+    r, theta = _parameters(r, theta)
+    charges = tuple(_charge(q) for q in charges)
+    L = basis.L
+    c, s = math.cos(theta), math.sin(theta)
+    coefficient = np.array([-c, -s, -c / _SQRT2])        # Eq. (15) with Eq. (12) sign
+    table, real = basis.phase_table(m)
+    dtype = np.float64 if real else np.complex128
+    col, row, t, f, kind = basis.hamiltonian_transitions()
+    sqrt_orbit = np.sqrt(basis.rep_orbit.astype(np.float64))
+    blocks: dict[str, SectorBlock] = {}
+
+    def values(select, parity):
+        cc, rr = col[select], row[select]
+        v = coefficient[kind[select]] * (sqrt_orbit[cc] / sqrt_orbit[rr])
+        v = v * table[(m * t[select].astype(np.int64)) % L]
+        if parity == -1:
+            v = v * (1 - 2 * f[select].astype(np.int64))
+        return v.astype(dtype, copy=False)
+
+    if "sigma" in charges:
+        comp = basis.compatible(m, -1)
+        reps = np.flatnonzero(comp)
+        local = _local_index(comp)
+        n = reps.size
+        select = comp[col] & comp[row]
+        H = _csr(np.concatenate([local[row[select]], np.arange(n)]),
+                 np.concatenate([local[col[select]], np.arange(n)]),
+                 np.concatenate([values(select, -1), -r * basis.rep_dw[reps]]),
+                 (n, n), dtype)
+        blocks["sigma"] = SectorBlock(L, m, "sigma", H, reps)
+
+    folded = [q for q in charges if q != "sigma"]
+    if folded:
+        comp = basis.compatible(m, 1)
+        part_a, part_b, part_e = basis.fold_partition()
+        in_a, in_b, in_e = comp & part_a, comp & part_b, comp & part_e
+        loc_a, loc_b, loc_e = _local_index(in_a), _local_index(in_b), _local_index(in_e)
+        a_reps, e_reps = np.flatnonzero(in_a), np.flatnonzero(in_e)
+        nA, nB, nE = a_reps.size, int(in_b.sum()), e_reps.size
+        from_a = in_a[col]
+        select = from_a & in_a[row]
+        H_AA = _csr(np.concatenate([loc_a[row[select]], np.arange(nA)]),
+                    np.concatenate([loc_a[col[select]], np.arange(nA)]),
+                    np.concatenate([values(select, 1), -r * basis.rep_dw[a_reps]]),
+                    (nA, nA), dtype)
+        select = from_a & in_b[row]
+        H_BA = _csr(loc_b[row[select]], loc_a[col[select]], values(select, 1), (nB, nA), dtype)
+        S = FoldCoupling(basis, m, comp, in_a, in_b, loc_a, loc_b, table, dtype)
+        if np.any((np.diff(H_BA.indptr) > 0) & (S.column_counts == 0)):
+            raise RuntimeError("H couples A to B representatives outside the fold interface")
+        vectors = {1: None, -1: None}
+        if nE:
+            select = from_a & in_e[row]
+            H_EA = _csr(loc_e[row[select]], loc_a[col[select]], values(select, 1), (nE, nA), dtype)
+            select = in_e[col] & in_e[row]
+            H_EE = _csr(np.concatenate([loc_e[row[select]], np.arange(nE)]),
+                        np.concatenate([loc_e[col[select]], np.arange(nE)]),
+                        np.concatenate([values(select, 1), -r * basis.rep_dw[e_reps]]),
+                        (nE, nE), dtype)
+            scol, srow, st, samp = basis.fold_structure()[1]
+            select = in_e[scol] & comp[srow]
+            scol, srow = scol[select], srow[select]
+            if np.any(~in_e[srow]):
+                raise RuntimeError("U(sigma) maps E outside E: fold partition is inconsistent")
+            sdata = samp[select] * table[(m * st[select]) % L] * (sqrt_orbit[scol] / sqrt_orbit[srow])
+            S_EE = _csr(loc_e[srow], loc_e[scol], sdata, (nE, nE), dtype)
+            vectors = _self_dual_eigenvectors(S_EE, basis.rep_g[e_reps], dtype)
+        for q in folded:
+            sign = _FOLD_SIGN[q]
+            U = W = D = None
+            if nE:
+                U = vectors[sign]
+                UH = U.getH().tocsr()
+                W = (_SQRT2 * (UH @ H_EA)).tocsr()
+                D = (UH @ H_EE @ U).tocsr()
+            blocks[q] = SectorBlock(L, m, q, H_AA, a_reps, sign=sign, H_BA=H_BA, S=S,
+                                    e_reps=e_reps, U_E=U, W=W, D=D)
+    return {q: blocks[q] for q in charges}
+
+
+def build_hamiltonian_block(basis: SymmetryBasis, m: int, charge: str, r: float,
+                            theta: float) -> SectorBlock:
+    """Single (m, charge) block. Use build_symmetry_blocks to share work between charges."""
+    return build_symmetry_blocks(basis, m, r, theta, charges=(_charge(charge),))[charge]
+
+
+def sector_dimensions(basis: SymmetryBasis, m: int) -> dict[str, int]:
+    """Dimensions of the three charge blocks at momentum m, without building them.
+
+    Inside E, S is a Hermitian involution, so dim E_(+-) = (|E| +- tr S_EE)/2.
+    """
+    m = basis.momentum(m)
+    L = basis.L
+    comp = basis.compatible(m, 1)
+    part_a, _, part_e = basis.fold_partition()
+    n_a, in_e = int((comp & part_a).sum()), comp & part_e
+    scol, srow, st, samp = basis.fold_structure()[1]
+    diagonal = in_e[scol] & (scol == srow)
+    table, _ = basis.phase_table(m)
+    trace = float(np.real(np.sum(samp[diagonal] * table[(m * st[diagonal]) % L])))
+    n_plus = (int(in_e.sum()) + round(trace)) // 2
+    return {"1": n_a + n_plus, "psi": n_a + int(in_e.sum()) - n_plus,
+            "sigma": int(basis.compatible(m, -1).sum())}
+
+
+# =============================================================================
+# Eigensolver
+# =============================================================================
+
+def _max_abs(matrix) -> float:
+    if issparse(matrix):
+        matrix = matrix.tocsr()
+        return float(np.max(np.abs(matrix.data))) if matrix.nnz else 0.0
+    array = np.asarray(matrix)
+    return float(np.max(np.abs(array))) if array.size else 0.0
+
+
+def _check_hermitian(H) -> None:
+    error = _max_abs(H - H.getH())
+    if error > 1e-10 * max(1.0, _max_abs(H)):
+        raise ValueError(f"H is not Hermitian (maximum discrepancy {error:.3g})")
+
+
+def _check_block_hermitian(block: SectorBlock, seed: int) -> None:
+    _check_hermitian(block.H)
+    if not block.folded or block.H_BA.nnz == 0:
+        return
+    # randomized test of the coupling C = S_AB H_BA, which is never formed here
+    rng = np.random.default_rng(seed)
+    n = block.H.shape[0]
+    x = rng.normal(size=n) + (1j * rng.normal(size=n) if block.dtype == np.complex128 else 0)
+    y = rng.normal(size=n) + (1j * rng.normal(size=n) if block.dtype == np.complex128 else 0)
+    cy = block.coupling(y)
+    cx = block.coupling(x)
+    error = abs(np.vdot(x, cy) - np.vdot(cx, y))
+    scale = np.linalg.norm(x) * np.linalg.norm(cy) + np.linalg.norm(cx) * np.linalg.norm(y)
+    if error > 1e-10 * max(1.0, scale):
+        raise ValueError(f"Fold coupling is not Hermitian (discrepancy {error:.3g})")
+
+
+def lowest_eigenpairs(H, nev: int = 5, *, return_residuals: bool = False,
+                      tol: float = 1e-11, maxiter: int | None = None,
+                      seed: int = 1729, dense_cutoff: int = 128,
+                      max_dense_dimension: int = 4096, block_format: str = "auto"):
+    """Return SORTED lowest (eigenvalues, eigenvectors[, residual_norms]).
+
+    H may be a SectorBlock or any sparse/dense Hermitian matrix. Complex scipy
+    eigsh delegates to eigs, which cannot use k >= N-1, so that range falls back
+    to dense eigh. A deterministic random start avoids confining Lanczos to a
+    residual-symmetry subspace. Degeneracies should still be checked densely for
+    small N.
+    """
+    nev = _integer(nev, "nev")
+    if nev < 1:
+        raise ValueError("nev must be positive")
+    dense_cutoff = _integer(dense_cutoff, "dense_cutoff")
+    if dense_cutoff < 0:
+        raise ValueError("dense_cutoff must be nonnegative")
+    max_dense_dimension = _integer(max_dense_dimension, "max_dense_dimension")
+    if max_dense_dimension < 1:
+        raise ValueError("max_dense_dimension must be positive")
+    if not isinstance(tol, Real) or not math.isfinite(tol) or tol < 0:
+        raise ValueError("tol must be finite and nonnegative")
+    if maxiter is not None and _integer(maxiter, "maxiter") < 1:
+        raise ValueError("maxiter must be positive or None")
+    seed = _integer(seed, "seed")
+    if isinstance(H, SectorBlock):
+        block = H
+        _check_block_hermitian(block, seed)
+        apply = block.matvec
+    else:
+        block = None
+        H = csr_matrix(H)
+        if H.shape[0] != H.shape[1]:
+            raise ValueError("H must be square")
+        if np.any(~np.isfinite(H.data)):
+            raise ValueError("H contains nonfinite matrix elements")
+        _check_hermitian(H)
+        apply = H.__matmul__
+    n = H.shape[0]
+    count = min(nev, n)
+    if n == 0:
+        evals = np.empty(0)
+        evecs = np.empty((0, 0), dtype=H.dtype)
+    elif n <= dense_cutoff or count >= n - 1:
+        if n > max_dense_dimension:
+            raise MemoryError(
+                f"Dense diagonalization of dimension {n} exceeds the guard "
+                f"{max_dense_dimension}; request fewer eigenvalues or explicitly "
+                "raise max_dense_dimension with sufficient memory.")
+        dense = block.to_dense() if block is not None else H.toarray()
+        evals, evecs = np.linalg.eigh(dense)
+        evals, evecs = evals[:count], evecs[:, :count]
+    else:
+        operator = block.operator(block_format) if block is not None else H
+        rng = np.random.default_rng(seed)
+        v0 = rng.normal(size=n)
+        if np.issubdtype(H.dtype, np.complexfloating):
+            v0 = v0 + 1j * rng.normal(size=n)
+        v0 /= np.linalg.norm(v0)
+        ncv = min(n, max(2 * count + 1, 32))
+        evals, evecs = eigsh(operator, k=count, which="SA", v0=v0, tol=tol,
+                             maxiter=maxiter, ncv=ncv)
+        order = np.argsort(evals)
+        evals, evecs = evals[order], evecs[:, order]
+    if return_residuals:
+        residuals = (np.linalg.norm(apply(evecs) - evecs * evals[None, :], axis=0)
+                     if n else np.empty(0))
+        return evals, evecs, residuals
+    return evals, evecs
+
+
+def solve_spectrum(basis: SymmetryBasis | int, r: float, theta: float, nev: int = 5, *,
+                   momenta=None, charges=CHARGES, mirror: bool = True,
+                   **eig_kwargs) -> dict[tuple[int, str], np.ndarray]:
+    """Return {(m, charge): sorted lowest eigenvalues}, k = 2*pi*m/L.
+
+    With mirror=True a sector m > L/2 whose partner L-m was already solved is
+    copied (H real => H_{L-m} = conj(H_m)). Pass a SymmetryBasis to reuse the
+    enumeration and operator structure across a parameter scan.
+    """
+    if isinstance(basis, Integral):
+        basis = SymmetryBasis(basis)
+    charges = tuple(_charge(q) for q in charges)
+    L = basis.L
+    ms = range(L) if momenta is None else sorted({basis.momentum(m) for m in momenta})
+    result: dict[tuple[int, str], np.ndarray] = {}
+    for m in ms:
+        partner = (L - m) % L
+        if mirror and partner < m and all((partner, q) in result for q in charges):
+            for q in charges:
+                result[(m, q)] = result[(partner, q)].copy()
+            continue
+        blocks = build_symmetry_blocks(basis, m, r, theta, charges)
+        for q in charges:
+            result[(m, q)] = lowest_eigenpairs(blocks[q], nev=nev, **eig_kwargs)[0]
+    return result
+
+
+# =============================================================================
+# Validation against the explicit reference implementation (small L)
+# =============================================================================
+
+def _symmetric_ket(basis: SymmetryBasis, reference: FullBasis, rep: int, m: int,
+                   parity: int) -> np.ndarray:
+    """|a;k,p> in the full basis, by an explicit sum over G (independent of `locate`)."""
+    L = basis.L
+    k = 2.0 * math.pi * m / L
+    state = basis.rep_state(rep)
+    vector = np.zeros(len(reference), dtype=np.complex128)
+    for f in (0, 1):
+        flipped = _psi_flip(state) if f else state
+        for t in range(L):
+            vector[reference.state_to_index[translate(flipped, t)]] += np.exp(1j * k * t) * parity ** f
+    norm = np.linalg.norm(vector)
+    if norm < 1e-8:
+        raise AssertionError("A representative is incompatible with its sector")
+    return vector / norm
+
+
+def explicit_isometry(basis: SymmetryBasis, reference: FullBasis, block: SectorBlock,
+                      usigma: csr_matrix) -> np.ndarray:
+    """Columns of the block's basis in the full basis (uses the REFERENCE U(sigma)).
+
+    Q^dagger H Q must reproduce block.to_dense(); this checks the vectorized
+    S_AB and E eigenvectors against Eq. (20) as implemented in symmetry_action.
+    """
+    if block.charge == "sigma":
+        columns = [_symmetric_ket(basis, reference, a, block.m, -1) for a in block.reps]
+        return np.array(columns).T.reshape(len(reference), len(columns))
+    QA = np.array([_symmetric_ket(basis, reference, a, block.m, 1) for a in block.reps])
+    QA = QA.T.reshape(len(reference), len(block.reps))
+    Q = (QA + block.sign * (usigma @ QA) / _SQRT2) / _SQRT2
+    if block.e_reps.size:
+        QE = np.array([_symmetric_ket(basis, reference, e, block.m, 1) for e in block.e_reps]).T
+        Q = np.hstack([Q, QE @ block.U_E.toarray()])
+    return Q
+
+
+def validate_model(basis: SymmetryBasis | int, r: float, theta: float,
+                   tolerance: float = 1e-9, max_dimension: int = 8000) -> dict:
+    """Small-system structural validation, including the full categorical symmetry.
+
+    Checks the symmetry algebra (22) on the reference operators; for every
+    (m, charge) block: isometry, Q^dag H Q = block, T = e^{-ik}, U(psi) and
+    U(sigma) eigenvalues from Eq. (24), Hermiticity and the m <-> L-m conjugation;
+    and that the union of all block spectra equals full ED.
+    """
+    if isinstance(basis, Integral):
+        basis = SymmetryBasis(basis)
+    if basis.dimension > max_dimension:
+        raise ValueError("Validation uses full dense ED; use L <= 10 for this check")
+    L = basis.L
+    reference = FullBasis(L)
+    H = full_hamiltonian(reference, r, theta)
+    T = translation_operator(reference)
+    ident = eye(len(reference), format="csr")
+    upsi = symmetry_operator(reference, "psi")
+    usigma = symmetry_operator(reference, "sigma")
+    errors = {
+        "H_hermiticity": _max_abs(H - H.getH()),
+        "translation_commutator": _max_abs(T @ H - H @ T),
+        "Upsi_hermiticity": _max_abs(upsi - upsi.getH()),
+        "Usigma_hermiticity": _max_abs(usigma - usigma.getH()),
+        "Upsi_squared_minus_I": _max_abs(upsi @ upsi - ident),
+        "Upsi_Usigma_minus_Usigma": _max_abs(upsi @ usigma - usigma),
+        "Usigma_Upsi_minus_Usigma": _max_abs(usigma @ upsi - usigma),
+        "Usigma_squared_minus_I_minus_Upsi": _max_abs(usigma @ usigma - ident - upsi),
+        "Upsi_H_commutator": _max_abs(upsi @ H - H @ upsi),
+        "Usigma_H_commutator": _max_abs(usigma @ H - H @ usigma),
+        "Usigma_T_commutator": _max_abs(usigma @ T - T @ usigma),
+    }
+    all_evals, dims = [], {q: 0 for q in CHARGES}
+    dense_blocks, block_evals, n_primary = {}, {}, {}
+    for m in range(L):
+        k = 2.0 * math.pi * m / L
+        blocks = build_symmetry_blocks(basis, m, r, theta)
+        for q, block in blocks.items():
+            dense = block.to_dense()
+            dense_blocks[(m, q)] = dense
+            block_evals[(m, q)] = np.linalg.eigvalsh(dense) if dense.size else np.empty(0)
+            n_primary[(m, q)] = block.H.shape[0]
+            dims[q] += dense.shape[0]
+            lam = CHARGE_LAMBDA[q]
+            tag = f"m{m}_{q}"
+            errors[f"{tag}_H_hermiticity"] = _max_abs(dense - dense.conj().T)
+            if dense.shape[0]:
+                Q = explicit_isometry(basis, reference, block, usigma)
+                errors[f"{tag}_isometry"] = _max_abs(Q.conj().T @ Q - np.eye(Q.shape[1]))
+                errors[f"{tag}_projected_H"] = _max_abs(Q.conj().T @ (H @ Q) - dense)
+                errors[f"{tag}_translation_eigenvalue"] = _max_abs(T @ Q - np.exp(-1j * k) * Q)
+                errors[f"{tag}_Upsi_eigenvalue"] = _max_abs(upsi @ Q - lam[1] * Q)
+                errors[f"{tag}_Usigma_eigenvalue"] = _max_abs(usigma @ Q - lam[2] * Q)
+                # factored application agrees with the explicit matrix
+                x = np.random.default_rng(m).normal(size=dense.shape[0])
+                errors[f"{tag}_factored_matvec"] = _max_abs(block.matvec(x) - dense @ x)
+                if block.folded and block.S.shape[1]:
+                    xb = np.random.default_rng(m + 1).normal(size=block.S.shape[1])
+                    errors[f"{tag}_walsh_hadamard_vs_sparse_S"] = _max_abs(
+                        block.S.apply(xb) - block.S_AB @ xb)
+                all_evals.extend(block_evals[(m, q)])
+    for m in range(1, L):
+        for q in CHARGES:
+            # H real => H_{L-m} = conj(H_m) on A (the E eigenvector basis is arbitrary)
+            nA = n_primary[(m, q)]
+            errors[f"m{m}_{q}_A_block_conjugate_of_m{L - m}"] = _max_abs(
+                dense_blocks[(m, q)][:nA, :nA] - dense_blocks[(L - m, q)][:nA, :nA].conj())
+            errors[f"m{m}_{q}_spectrum_equals_m{L - m}"] = _max_abs(
+                block_evals[(m, q)] - block_evals[(L - m, q)])
+    D = len(reference)
+    expected = {"1": (D + 1) // 4, "psi": (D + 1) // 4, "sigma": (D - 1) // 2}
+    if dims != expected or sum(dims.values()) != D:
+        raise AssertionError(f"Charge-sector dimensions {dims} differ from {expected}")
+    errors["full_vs_block_spectrum"] = _max_abs(
+        np.sort(all_evals) - np.linalg.eigvalsh(H.toarray()))
+    failed = {key: value for key, value in errors.items() if value > tolerance}
+    if failed:
+        raise AssertionError(f"Validation failed (absolute tolerance {tolerance}): {failed}")
+    return {"passed": True, "dimension": D, "charge_dimensions": dims,
+            "max_error": max(errors.values()), "errors": errors}
+
+
+# =============================================================================
+# Driver
+# =============================================================================
+
+_COLORS = {"1": "tab:red", "psi": "tab:blue", "sigma": "tab:green"}
+_LABELS = {"1": r"$(1,1,\sqrt{2})$", "psi": r"$(1,1,-\sqrt{2})$", "sigma": r"$(1,-1,0)$"}
+
+
+def plot_spectrum(spectrum: dict, L: int, *, rescale: bool = False, ymax: float | None = None,
+                  title: str | None = None, save: Path | None = None, show: bool = True):
+    """Paper-style E(k) plot coloured by charge (cf. Fig. 3)."""
+    import matplotlib.pyplot as plt
+    from matplotlib.ticker import MaxNLocator
+
+    E0 = min(float(np.min(v)) for v in spectrum.values() if len(v))
+    scale, ylabel = 1.0, "Energy $E-E_0$"
+    if rescale:
+        # Fig. 3(b): lowest charge-1 state at m=2 (stress tensor) has E=2.
+        stress = spectrum.get((2 % L, "1"))
+        if stress is None or not len(stress) or float(stress[0]) - E0 <= 0:
+            raise ValueError("rescale needs the (m=2, charge 1) sector")
+        scale, ylabel = 2.0 / (float(stress[0]) - E0), r"Rescaled $E-E_0$"
+    offsets = {"1": -0.15, "psi": 0.0, "sigma": 0.15}
+    fig, ax = plt.subplots(figsize=(5, 7))
+    for q in CHARGES:
+        xs, ys = [], []
+        for (m, charge), values in spectrum.items():
+            if charge == q:
+                xs.extend([m + offsets[q]] * len(values))
+                ys.extend(scale * (np.asarray(values) - E0))
+        if xs:
+            ax.scatter(xs, ys, color=_COLORS[q], marker="x", zorder=3, label=_LABELS[q])
+    if ymax is not None:
+        ax.set_ylim(-0.02 * ymax, ymax)
+    ax.xaxis.set_major_locator(MaxNLocator(integer=True))
+    ax.set_xlabel(r"Momentum $m$ ($k=2\pi m/L$)")
+    ax.set_ylabel(ylabel)
+    ax.set_title(title or f"L={L}")
+    ax.grid(True, linestyle="--", alpha=0.6)
+    ax.legend(title=r"$(\lambda_1,\lambda_\psi,\lambda_\sigma)$")
+    fig.tight_layout()
+    if save is not None:
+        fig.savefig(save, dpi=150)
+    if show:
+        plt.show()
+    return fig
+
+
+def run_simulation(L=12, r=0.0, theta=math.pi / 4, nev=12):
+    parser = argparse.ArgumentParser(description=__doc__,
+                                     formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("--L", type=int, default=L)
+    parser.add_argument("--r", type=float, default=r)
+    parser.add_argument("--theta", type=float, default=theta,
+                        help="angle in radians (default pi/4)")
+    parser.add_argument("--nev", type=int, default=nev, help="eigenvalues per (m, charge) block")
+    parser.add_argument("--charges", nargs="+", choices=CHARGES, default=list(CHARGES))
+    parser.add_argument("--momenta", type=int, nargs="+", help="integer m values (default: all)")
+    parser.add_argument("--all-momenta", action="store_true",
+                        help="diagonalize m > L/2 too instead of copying conj(H_{L-m})")
+    parser.add_argument("--block-format", choices=("auto", "explicit", "factored"),
+                        default="auto", help="explicit or factored charge-1/psi blocks")
+    parser.add_argument("--max-states", type=int, default=300_000_000)
+    parser.add_argument("--dense-cutoff", type=int, default=128)
+    parser.add_argument("--output", type=Path, help="optional JSON output path")
+    parser.add_argument("--validate", action="store_true", help="full small-system checks, L<=10")
+    parser.add_argument("--rescale", action="store_true",
+                        help="rescale so the lowest (m=2, charge 1) level is 2, as in Fig. 3b")
+    parser.add_argument("--ymax", type=float, help="upper y limit of the plot")
+    parser.add_argument("--save-plot", type=Path, help="write the figure to this file")
+    parser.add_argument("--no-plot", action="store_true")
+    args = parser.parse_args()
+    r, theta = _parameters(args.r, args.theta)
+    if args.validate and hilbert_dimension(args.L) > 8000:
+        parser.error("--validate compares with full dense ED; use it with L <= 10")
+    start = time.perf_counter()
+    basis = SymmetryBasis(args.L, max_states=args.max_states)
+    basis.hamiltonian_transitions()
+    basis.fold_structure()
+    L = basis.L
+    print(f"L={L}, dimension={basis.dimension:,}, G-orbits={basis.n_reps:,}, "
+          f"r={r:.12g}, theta={theta:.12g}  (setup {time.perf_counter() - start:.2f} s)")
+    print("T is right translation; T eigenvalue exp(-ik), k=2*pi*m/L; "
+          "charges (lambda_1, lambda_psi, lambda_sigma) as in Eq. (24)")
+    result = {"L": L, "r": r, "theta": theta, "dimension": basis.dimension,
+              "translation": "right", "translation_eigenvalue": "exp(-i*k)",
+              "momentum_formula": "k=2*pi*m/L",
+              "charges": {q: list(CHARGE_LAMBDA[q]) for q in args.charges},
+              "sectors": []}
+    ms = range(L) if args.momenta is None else sorted({basis.momentum(m) for m in args.momenta})
+    charges = tuple(args.charges)
+    spectrum: dict[tuple[int, str], np.ndarray] = {}
+    dims: dict[tuple[int, str], int] = {}
+    for m in ms:
+        partner = (L - m) % L
+        mirrored = (not args.all_momenta and partner < m
+                    and all((partner, q) in spectrum for q in charges))
+        tick = time.perf_counter()
+        if mirrored:
+            solved = {q: (spectrum[(partner, q)], None, dims[(partner, q)]) for q in charges}
+        else:
+            blocks = build_symmetry_blocks(basis, m, r, theta, charges)
+            solved = {}
+            for q in charges:
+                evals, _, res = lowest_eigenpairs(blocks[q], nev=args.nev, return_residuals=True,
+                                                  dense_cutoff=args.dense_cutoff,
+                                                  block_format=args.block_format)
+                solved[q] = (evals, res, blocks[q].shape[0])
+        for q in charges:
+            evals, res, dim = solved[q]
+            spectrum[(m, q)], dims[(m, q)] = evals, dim
+            result["sectors"].append({
+                "m": m, "k": 2 * math.pi * m / L, "charge": q,
+                "lambda": list(CHARGE_LAMBDA[q]), "dimension": int(dim),
+                "eigenvalues": np.asarray(evals).tolist(),
+                "residual_norms": None if res is None else np.asarray(res).tolist(),
+                "copied_from_m": partner if mirrored else None})
+            printed = " ".join(f"{e:.12f}" for e in evals)
+            print(f"m={m:2d}  {q:>5s}  dim={dim:8d}  E: {printed}")
+        if not mirrored:
+            print(f"      (m={m} solved in {time.perf_counter() - tick:.2f} s)")
+    print(f"Total time {time.perf_counter() - start:.2f} s")
+    if args.validate:
+        result["validation"] = validate_model(basis, r, theta)
+        print(f"Validation passed; maximum absolute discrepancy "
+              f"{result['validation']['max_error']:.3e}")
+    if args.output:
+        args.output.parent.mkdir(parents=True, exist_ok=True)
+        args.output.write_text(json.dumps(result, indent=2) + "\n", encoding="utf-8")
+        print(f"Wrote {args.output}")
+    if not args.no_plot or args.save_plot:
+        plot_spectrum(spectrum, L, rescale=args.rescale, ymax=args.ymax,
+                      title=rf"$L={L}$, $(r,\theta)=({r:.3g},{theta:.3g})$",
+                      save=args.save_plot, show=not args.no_plot)
+    return result
+
+
+if __name__ == "__main__":
+    for r in range(-30, 31, 5):
+        run_simulation(L=3, r=r, theta=math.pi / 4, nev=4)

@@ -20,6 +20,7 @@ import math
 from numbers import Integral, Real
 from pathlib import Path
 from typing import Iterator
+import time
 
 import numpy as np
 from scipy.sparse import coo_matrix, csr_matrix, eye, issparse
@@ -658,6 +659,9 @@ def run_simulation(L=12, r=0, theta=math.pi/4, nev=12):
     plt.grid(True, linestyle='--', alpha=0.6)
     plt.legend(title=r"$\mathcal{C}_{\text{Ising}}$ Irrep Charges $\vec{\lambda}$", loc='best')
     plt.tight_layout()
+    # plt.ylim([-0.001, 0.13]) # r = -20, theta = pi/4
+    # plt.ylim([-0.000001, 0.000032]) # r = 20, theta = pi/4/
+    # plt.ylim([-0.01, 2.5]) # r = 0, theta = pi/4
 
     # Save data
     fig_filename = f"spectrum_L{args.L}_r{args.r}_theta{args.theta:.2f}.png"
@@ -667,4 +671,6 @@ def run_simulation(L=12, r=0, theta=math.pi/4, nev=12):
 
 
 if __name__ == "__main__":
-    run_simulation(L=3, r=20.0, theta=np.pi/4, nev=4)
+    t_0 = time.perf_counter()
+    run_simulation(L=7, r=0.0, theta=np.pi/4, nev=10)
+    print(time.perf_counter() - t_0)

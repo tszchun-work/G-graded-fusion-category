@@ -36,11 +36,12 @@ import math
 from numbers import Integral, Real
 from pathlib import Path
 from typing import Iterator
+import time
 
 import numpy as np
 from scipy.sparse import coo_matrix, csr_matrix, eye, issparse
 from scipy.sparse.linalg import eigsh
-import matplotlib.pyplot as plt # added
+import matplotlib.pyplot as plt
 
 I, PSI, SIGMA = 0, 1, 2
 State = tuple[int, ...]
@@ -574,25 +575,26 @@ def run_simulation(L=12, r=0, theta=math.pi/4, nev=12):
         args.output.write_text(json.dumps(result, indent=2) + "\n", encoding="utf-8")
         print(f"Wrote {args.output}")
 
-    # plot the results
-    plt.figure(figsize=(5, 7))
+    # # plot the results
+    # plt.figure(figsize=(5, 7))
 
-    # the axes
-    energy = np.array(energy)
-    ks = np.arange(L)
+    # # the axes
+    # energy = np.array(energy)
+    # ks = np.arange(L)
 
-    for idx, k in enumerate(ks):
-        # Scatter plot all eigenvalues for each k sector
-        plt.scatter([k] * len(energy[idx]), energy[idx] - np.min(energy), color='blue', zorder=3, marker='x') # reset reference level
+    # for idx, k in enumerate(ks):
+    #     # Scatter plot all eigenvalues for each k sector
+    #     plt.scatter([k] * len(energy[idx]), energy[idx] - np.min(energy), color='blue', zorder=3, marker='x') # reset reference level
 
-    # plt.ylim([-0.001, 0.13]) # r = -20, theta = pi/4
-    # plt.ylim([-0.000001, 0.000032]) # r = 20, theta = pi/4/
+    # # plt.ylim([-0.001, 0.13]) # r = -20, theta = pi/4
+    # # plt.ylim([-0.000001, 0.000032]) # r = 20, theta = pi/4/
     # plt.ylim([-0.01, 2.5]) # r = 0, theta = pi/4
-    plt.xlabel(r'Momentum $k$')
-    plt.ylabel('Energy $E$')
-    plt.grid(True, linestyle='--', alpha=0.6)
-    plt.tight_layout()
-    plt.show()
+    # plt.xlabel(r'Momentum $k$')
+    # plt.ylabel('Energy $E$')
+    # plt.grid(True, linestyle='--', alpha=0.6)
+    # plt.tight_layout()
+    # plt.show()
     
-
-run_simulation(L=8, r=0.0, theta=np.pi/4, nev=4)
+t0 = time.perf_counter()
+run_simulation(L=10, r=20.0, theta=np.pi/4, nev=5)
+print(time.perf_counter() - t0)

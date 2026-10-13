@@ -1449,6 +1449,7 @@ def plot_spectrum(spectrum: dict, L: int, *, rescale: bool = False, ymax: float 
     ax.xaxis.set_major_locator(MaxNLocator(integer=True))
     ax.set_xlabel(r"Momentum $m$ ($k=2\pi m/L$)")
     ax.set_ylabel(ylabel)
+    # ax.set_ylim([-0.000001, 0.00005])
     ax.set_title(title or f"L={L}")
     ax.grid(True, linestyle="--", alpha=0.6)
     ax.legend(title=r"$(\lambda_1,\lambda_\psi,\lambda_\sigma)$")
@@ -1550,5 +1551,63 @@ def run_simulation(L=12, r=0.0, theta=math.pi / 4, nev=12):
 
 
 if __name__ == "__main__":
-    for r in range(-30, 31, 5):
-        run_simulation(L=3, r=r, theta=math.pi / 4, nev=4)
+    run_simulation(L=12, r=20.0, theta=math.pi/4, nev=12)
+    # import sys
+    # import math
+    # import numpy as np
+    # import matplotlib.pyplot as plt
+
+    # # 1. Set up the parameter sweep range
+    # r_values = np.linspace(-2.0, -0.25, 10)
+    # theta = math.pi / 4
+
+    # # Prevent run_simulation from rendering individual spectrum plots during the sweep
+    # sys.argv = [sys.argv[0], "--no-plot"]
+
+    # print(f"Starting sweep over r from {r_values[0]:.2f} to {r_values[-1]:.2f} across {len(r_values)} points...")
+
+    # # Create a single figure before sweeping across L
+    # plt.figure(figsize=(8, 5))
+
+    # # 2. Run simulation and compute energy ratio for each L and r
+    # for L in [8, 10, 12, 14]:
+    #     ratios = []  # Reset ratios list for each L
+        
+    #     for i, r in enumerate(r_values, 1):
+    #         print(f"\n================ L={L}, Point {i}/10: r = {r:.6f} ================")
+            
+    #         # Run simulation for current r with fixed theta
+    #         res = run_simulation(L=L, r=r, theta=theta)
+            
+    #         # Flatten and sort all eigenvalues collected across all momentum/charge sectors
+    #         all_evals = []
+    #         for sector in res["sectors"]:
+    #             all_evals.extend(sector["eigenvalues"])
+    #         all_evals = sorted(all_evals)
+            
+    #         # Extract lowest three energy levels (E0 <= E1 <= E2)
+    #         E0, E1, E2 = all_evals[0], all_evals[1], all_evals[2]
+            
+    #         # Calculate ratio (E1 - E0) / (E2 - E0)
+    #         denom = E1 - E0
+    #         if abs(denom) < 1e-12:
+    #             ratio = np.nan
+    #             print(f"Warning: E1 - E0 is zero/near-zero ({denom:.2e}). Setting ratio to NaN.")
+    #         else:
+    #             ratio = (E2 - E0) / denom / 8
+
+    #         ratios.append(ratio)
+    #         print(f"E0 = {E0:.10f}, E1 = {E1:.10f}, E2 = {E2:.10f}")
+    #         print(f"Ratio (E2 - E0) / (E1 - E0) = {ratio:.8f}")
+
+    #     # Plot the curve for current L
+    #     plt.plot(r_values, ratios, "o-", linewidth=2, markersize=6, label=f"$L={L}$")
+
+    # # 3. Finalize and show the combined figure
+    # plt.xlabel(r"Parameter $r$", fontsize=12)
+    # plt.ylabel(r"Energy Ratio $\frac{E_2 - E_0}{E_1 - E_0}$", fontsize=12)
+    # plt.title(rf"Energy Gap Ratio vs $r$ ($\theta = \pi/4$)", fontsize=14)
+    # plt.grid(True, linestyle="--", alpha=0.6)
+    # plt.legend(fontsize=12)
+    # plt.tight_layout()
+    # plt.show()
